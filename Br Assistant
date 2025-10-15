@@ -1,0 +1,369 @@
+<Application x:Class="BRDesktopAssistant.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             ShutdownMode="OnExplicitShutdown"
+             StartupUri="MainWindow.xaml">
+  <Application.Resources>
+  </Application.Resources>
+</Application>
+
+using System.Windows;
+
+namespace BRDesktopAssistant
+{
+    public partial class App : Application
+    {
+    }
+}
+
+<Project Sdk="Microsoft.NET.Sdk.WindowsDesktop">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <ApplicationIcon>Assets\br.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Text.Json" Version="8.0.4" />
+    <PackageReference Include="DocumentFormat.OpenXml" Version="3.0.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="Assets\br.ico" />
+  </ItemGroup>
+</Project>
+
+<Window x:Class="BRDesktopAssistant.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Б&Р Ассистент — Desktop" Height="720" Width="1040" MinHeight="560" MinWidth="880"
+        Icon="Assets/br.ico" WindowStartupLocation="CenterScreen">
+  <Grid Background="#0f172a">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+
+    <!-- Панель действий -->
+    <StackPanel Orientation="Horizontal" Margin="16" Grid.Row="0">
+      <Button Content="Счёт" Margin="0,0,8,0" Padding="12,6" Click="Invoice_Click"/>
+      <Button Content="Накладная" Margin="0,0,8,0" Padding="12,6" Click="Waybill_Click"/>
+      <Button Content="Акт" Margin="0,0,8,0" Padding="12,6" Click="Act_Click"/>
+      <Separator Width="20"/>
+      <ToggleButton x:Name="SttToggle" Content="🎙️ Распознавание" Margin="0,0,8,0" Padding="12,6" Checked="SttToggle_Checked" Unchecked="SttToggle_Unchecked"/>
+      <ToggleButton x:Name="TtsToggle" Content="🔊 Озвучка" Margin="0,0,8,0" Padding="12,6" IsChecked="True"/>
+      <Separator Width="20"/>
+      <Button Content="⚡ Позвать Бир (Ctrl+Alt+B)" IsEnabled="False" Padding="12,6"/>
+    </StackPanel>
+
+    <!-- История -->
+    <ScrollViewer Grid.Row="1" Name="HistoryScroll" VerticalScrollBarVisibility="Auto" Margin="16,0,16,0">
+      <StackPanel Name="HistoryPanel" />
+    </ScrollViewer>
+
+    <!-- Ввод -->
+    <DockPanel Grid.Row="2" Margin="16">
+      <TextBox x:Name="PromptBox" DockPanel.Dock="Left" Height="60" FontSize="16"
+               Background="#111827" Foreground="#e5e7eb" BorderBrush="#374151" BorderThickness="1"
+               Padding="10" TextWrapping="Wrap" AcceptsReturn="True" VerticalContentAlignment="Center"
+               ToolTip="Введите запрос и нажмите Enter"/>
+      <StackPanel Orientation="Horizontal" DockPanel.Dock="Right" Margin="8,0,0,0">
+        <Button x:Name="SendBtn" Content="Отправить" Width="140" Height="60" Click="SendBtn_Click"
+                Background="#2563eb" Foreground="White" BorderBrush="#2563eb"/>
+      </StackPanel>
+    </DockPanel>
+  </Grid>
+</Window>
+
+using System;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Speech.Recognition;
+using System.Speech.Synthesis;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Forms; // NotifyIcon
+using System.Windows.Input;
+using System.Windows.Media;
+using BRDesktopAssistant.Models;
+using BRDesktopAssistant.Services;
+using BRDesktopAssistant.Utils;
+using Application = System.Windows.Application;
+using MessageBox = System.Windows.MessageBox;
+
+namespace BRDesktopAssistant
+{
+    public partial class MainWindow : Window
+    {
+        private readonly OpenAIClient _client;
+        private readonly ChatMessage[] _system;
+        private readonly SpeechSynthesizer _tts = new SpeechSynthesizer();
+        private SpeechRecognitionEngine? _stt;
+        private readonly NotifyIcon _tray;
+        private bool _startWithWindows = false;
+        private readonly string _appData;
+        private readonly string _docsDir;
+
+        public MainWindow()
+        {
+            InitializeComponent();
+
+            _appData = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "BRDesktopAssistant");
+            Directory.CreateDirectory(_appData);
+            _docsDir = Path.Combine(_appData, "Documents");
+            Directory.CreateDirectory(_docsDir);
+
+            // OpenAI
+            _client = new OpenAIClient();
+            _system = new[]
+            {
+                new ChatMessage("system", "Ты — голосовой/текстовый ассистент Б&Р (Бизнес и Разум). Помогаешь предпринимателю: создаёшь счета, накладные, акты (DOCX), даёшь советы по автоматизации и продажам. Отвечай кратко, шагами, на русском.")
+            };
+
+            // TTS
+            try
+            {
+                _tts.Rate = 0;
+                _tts.Volume = 100;
+                // Попытка выбрать русскую голосовую
+                var ru = _tts.GetInstalledVoices().FirstOrDefault(v => v.VoiceInfo.Culture.Name.StartsWith("ru", StringComparison.OrdinalIgnoreCase));
+                if (ru != null) _tts.SelectVoice(ru.VoiceInfo.Name);
+            }
+            catch { }
+
+            // STT подготовка (не включаем до клика)
+            InitTray();
+            RegisterHotkey();
+
+            PromptBox.KeyDown += async (s, e) =>
+            {
+                if (e.Key == Key.Enter && !Keyboard.IsKeyDown(Key.LeftShift))
+                {
+                    e.Handled = true;
+                    await SendAsync();
+                }
+            };
+        }
+
+        private void InitTray()
+        {
+            _tray = new NotifyIcon();
+            _tray.Icon = new System.Drawing.Icon(AppDomain.CurrentDomain.BaseDirectory + "Assets\\br.ico");
+            _tray.Visible = true;
+            _tray.Text = "Б&Р Ассистент";
+
+            var menu = new ContextMenuStrip();
+            menu.Items.Add("Показать окно", null, (_, __) => { this.Show(); this.WindowState = WindowState.Normal; this.Activate(); });
+            var ttsItem = new ToolStripMenuItem("Озвучка (TTS)") { Checked = true, CheckOnClick = true };
+            ttsItem.CheckedChanged += (_, __) => { TtsToggle.IsChecked = ttsItem.Checked; };
+            menu.Items.Add(ttsItem);
+            var sttItem = new ToolStripMenuItem("Распознавание (STT)") { Checked = false, CheckOnClick = true };
+            sttItem.CheckedChanged += (_, __) => {
+                if (sttItem.Checked) StartStt();
+                else StopStt();
+            };
+            menu.Items.Add(sttItem);
+            menu.Items.Add(new ToolStripSeparator());
+            var autoStart = new ToolStripMenuItem("Автозапуск Windows") { Checked = _startWithWindows, CheckOnClick = true };
+            autoStart.CheckedChanged += (_, __) => { _startWithWindows = autoStart.Checked; StartupHelper.SetAutorun(_startWithWindows); };
+            menu.Items.Add(autoStart);
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add("Выход", null, (_, __) => { _tray.Visible = false; Application.Current.Shutdown(); });
+
+            _tray.ContextMenuStrip = menu;
+            _tray.DoubleClick += (_, __) => { this.Show(); this.WindowState = WindowState.Normal; this.Activate(); };
+        }
+
+        private void RegisterHotkey()
+        {
+            // Ctrl+Alt+B
+            HotkeyManager.Register(this, HotkeyModifiers.MOD_CONTROL | HotkeyModifiers.MOD_ALT, System.Windows.Forms.Keys.B, () =>
+            {
+                this.Show();
+                this.WindowState = WindowState.Normal;
+                this.Activate();
+                PromptBox.Focus();
+            });
+        }
+
+        private Border MakeBubble(string text, bool isUser)
+        {
+            var tb = new TextBlock
+            {
+                Text = text,
+                TextWrapping = TextWrapping.Wrap,
+                Foreground = Brushes.White,
+                Margin = new Thickness(10)
+            };
+
+            return new Border
+            {
+                Background = (isUser ? new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1f2937"))
+                                      : new SolidColorBrush((Color)ColorConverter.ConvertFromString("#111827"))),
+                CornerRadius = new CornerRadius(12),
+                Padding = new Thickness(4),
+                Margin = new Thickness(0, 6, 0, 6),
+                Child = tb,
+                HorizontalAlignment = isUser ? HorizontalAlignment.Right : HorizontalAlignment.Left,
+                MaxWidth = 760
+            };
+        }
+
+        private async Task SendAsync()
+        {
+            var prompt = PromptBox.Text?.Trim();
+            if (string.IsNullOrEmpty(prompt)) return;
+
+            HistoryPanel.Children.Add(MakeBubble(prompt, true));
+            PromptBox.Clear();
+            HistoryScroll.ScrollToEnd();
+
+            try
+            {
+                var messages = _system.Concat(new[] { new ChatMessage("user", prompt) }).ToArray();
+                var reply = await _client.GetChatCompletionAsync(messages);
+
+                HistoryPanel.Children.Add(MakeBubble(reply, false));
+                HistoryScroll.ScrollToEnd();
+
+                if (TtsToggle.IsChecked == true)
+                {
+                    try { _tts.SpeakAsyncCancelAll(); _tts.SpeakAsync(reply); } catch { }
+                }
+            }
+            catch (Exception ex)
+            {
+                HistoryPanel.Children.Add(MakeBubble($"Ошибка: {ex.Message}", false));
+                HistoryScroll.ScrollToEnd();
+            }
+        }
+
+        // ==== STT ====
+        private void StartStt()
+        {
+            try
+            {
+                if (_stt != null) return;
+                var culture = new CultureInfo("ru-RU");
+                try { _stt = new SpeechRecognitionEngine(culture); }
+                catch { _stt = new SpeechRecognitionEngine(new CultureInfo("en-US")); }
+
+                _stt.SetInputToDefaultAudioDevice();
+                var dict = new Choices("создай счёт", "создай накладную", "создай акт", "отправить", "позвать бир");
+                var gb = new GrammarBuilder(dict) { Culture = _stt.RecognizerInfo.Culture };
+                var grammar = new Grammar(gb);
+                _stt.LoadGrammar(grammar);
+                _stt.SpeechRecognized += (s, e) =>
+                {
+                    var text = e.Result?.Text ?? "";
+                    if (text.Contains("счёт")) Invoice_Click(this, new RoutedEventArgs());
+                    else if (text.Contains("накладную")) Waybill_Click(this, new RoutedEventArgs());
+                    else if (text.Contains("акт")) Act_Click(this, new RoutedEventArgs());
+                    else if (text.Contains("отправить")) _ = SendAsync();
+                    else if (text.Contains("бир")) HotkeyManager.Trigger();
+                };
+                _stt.RecognizeAsync(RecognizeMode.Multiple);
+                SttToggle.IsChecked = true;
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("STT не удалось запустить: " + ex.Message);
+                SttToggle.IsChecked = false;
+            }
+        }
+
+        private void StopStt()
+        {
+            try
+            {
+                _stt?.RecognizeAsyncStop();
+                _stt = null;
+            }
+            catch { }
+        }
+
+        private void SttToggle_Checked(object sender, RoutedEventArgs e) => StartStt();
+        private void SttToggle_Unchecked(object sender, RoutedEventArgs e) => StopStt();
+
+        // ==== Документы ====
+        private void Invoice_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                var path = DocService.CreateInvoice(_docsDir, "Орлов", "Ерохин", "Подписка на ассистента", 1, 30000m);
+                HistoryPanel.Children.Add(MakeBubble($"Счёт создан: {path}", false));
+                HistoryScroll.ScrollToEnd();
+            }
+            catch (Exception ex) { HistoryPanel.Children.Add(MakeBubble($"Ошибка счёта: {ex.Message}", false)); }
+        }
+        private void Waybill_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                var path = DocService.CreateWaybill(_docsDir, "Орлов", "Ерохин", "Подписка на ассистента", 1, 30000m);
+                HistoryPanel.Children.Add(MakeBubble($"Накладная создана: {path}", false));
+                HistoryScroll.ScrollToEnd();
+            }
+            catch (Exception ex) { HistoryPanel.Children.Add(MakeBubble($"Ошибка накладной: {ex.Message}", false)); }
+        }
+        private void Act_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                var path = DocService.CreateAct(_docsDir, "Орлов Кирилл Евгеньевич", "Ерохин Андрей Николаевич", "Подписка на ассистента", 30000m);
+                HistoryPanel.Children.Add(MakeBubble($"Акт создан: {path}", false));
+                HistoryScroll.ScrollToEnd();
+            }
+            catch (Exception ex) { HistoryPanel.Children.Add(MakeBubble($"Ошибка акта: {ex.Message}", false)); }
+        }
+
+        protected override void OnStateChanged(EventArgs e)
+        {
+            base.OnStateChanged(e);
+            if (WindowState == WindowState.Minimized) this.Hide();
+        }
+
+        protected override void OnClosed(EventArgs e)
+        {
+            _tray.Visible = false;
+            HotkeyManager.Unregister(this);
+            base.OnClosed(e);
+        }
+    }
+}
+
+# Б&Р Ассистент — PRO (WPF .NET 8)
+
+Функции:
+- Чат с GPT (OpenAI API)
+- Голос: озвучка (TTS), распознавание команд (STT)
+- Кнопки: Счёт, Накладная, Акт — генерация DOCX в `%AppData%\BRDesktopAssistant\Documents`
+- Трей-иконка, автозапуск Windows через реестр, глобальный хоткей **Ctrl+Alt+B** («Позвать Бир»)
+- Иконка приложения
+
+## Сборка локально
+1. Установите .NET 8 SDK
+2. Создайте переменную `OPENAI_API_KEY`
+3. В папке проекта:
+```
+dotnet restore
+dotnet run
+```
+Публикация в один exe:
+```
+dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true
+```
+
+## Голос
+- TTS использует установленный голос Windows; если есть русский — выберется автоматически.
+- STT включает простые голосовые команды: «создай счёт / накладную / акт», «отправить», «позвать бир».
+
+## Артефакты
+Готовые файлы лежат в `%AppData%\BRDesktopAssistant\Documents`.
